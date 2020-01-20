@@ -23,7 +23,7 @@ var valAttrName = "v"
 
 // Client is a gokv.Store implementation for DynamoDB.
 type Client struct {
-	c         *awsdynamodb.DynamoDB
+	svc       *awsdynamodb.DynamoDB
 	tableName string
 	codec     encoding.Codec
 }
@@ -53,7 +53,7 @@ func (c Client) Set(k string, v interface{}) error {
 		TableName: &c.tableName,
 		Item:      item,
 	}
-	_, err = c.c.PutItem(&putItemInput)
+	_, err = c.svc.PutItem(&putItemInput)
 	if err != nil {
 		return err
 	}
@@ -79,7 +79,7 @@ func (c Client) Get(k string, v interface{}) (found bool, err error) {
 		TableName: &c.tableName,
 		Key:       key,
 	}
-	getItemOutput, err := c.c.GetItem(&getItemInput)
+	getItemOutput, err := c.svc.GetItem(&getItemInput)
 	if err != nil {
 		return false, err
 	} else if getItemOutput.Item == nil {
@@ -125,45 +125,9 @@ func (c Client) Close() error {
 
 // Options are the options for the DynamoDB client.
 type Options struct {
-	// Region of the DynamoDB service you want to use.
-	// Valid values: https://docs.aws.amazon.com/general/latest/gr/rande.html#ddb_region.
-	// E.g. "us-west-2".
-	// Optional (read from shared config file or environment variable if not set).
-	// Environment variable: "AWS_REGION".
-	Region string
-	// Name of the DynamoDB table.
-	// Optional ("gokv" by default).
+	Session   *session.Session
+	AWSConfig *aws.Config
 	TableName string
-	// ReadCapacityUnits of the table.
-	// Only required when the table doesn't exist yet and is created by gokv.
-	// Optional (5 by default, which is the same default value as when creating a table in the web console)
-	// 25 RCUs are included in the free tier (across all tables).
-	// For example calculations, see https://github.com/awsdocs/amazon-dynamodb-developer-guide/blob/c420420a59040c5b3dd44a6e59f7c9e55fc922ef/doc_source/HowItWorks.ProvisionedThroughput.
-	// For limits, see https://github.com/awsdocs/amazon-dynamodb-developer-guide/blob/c420420a59040c5b3dd44a6e59f7c9e55fc922ef/doc_source/Limits.md#capacity-units-and-provisioned-throughput.md#provisioned-throughput.
-	ReadCapacityUnits int64
-	// ReadCapacityUnits of the table.
-	// Only required when the table doesn't exist yet and is created by gokv.
-	// Optional (5 by default, which is the same default value as when creating a table in the web console)
-	// 25 RCUs are included in the free tier (across all tables).
-	// For example calculations, see https://github.com/awsdocs/amazon-dynamodb-developer-guide/blob/c420420a59040c5b3dd44a6e59f7c9e55fc922ef/doc_source/HowItWorks.ProvisionedThroughput.
-	// For limits, see https://github.com/awsdocs/amazon-dynamodb-developer-guide/blob/c420420a59040c5b3dd44a6e59f7c9e55fc922ef/doc_source/Limits.md#capacity-units-and-provisioned-throughput.md#provisioned-throughput.
-	WriteCapacityUnits int64
-	// If the table doesn't exist yet, gokv creates it.
-	// If WaitForTableCreation is true, gokv will block until the table is created, with a timeout of 15 seconds.
-	// If the table still doesn't exist after 15 seconds, an error is returned.
-	// If WaitForTableCreation is false, gokv returns the client immediately.
-	// In the latter case you need to make sure that you don't read from or write to the table before it's created,
-	// because otherwise you will get ResourceNotFoundException errors.
-	// Optional (true by default).
-	WaitForTableCreation *bool
-	// AWS access key ID (part of the credentials).
-	// Optional (read from shared credentials file or environment variable if not set).
-	// Environment variable: "AWS_ACCESS_KEY_ID".
-	AWSaccessKeyID string
-	// AWS secret access key (part of the credentials).
-	// Optional (read from shared credentials file or environment variable if not set).
-	// Environment variable: "AWS_SECRET_ACCESS_KEY".
-	AWSsecretAccessKey string
 	// CustomEndpoint allows you to set a custom DynamoDB service endpoint.
 	// This is especially useful if you're running a "DynamoDB local" Docker container for local testing.
 	// Typical value for the Docker container: "http://localhost:8000".
@@ -181,13 +145,7 @@ type Options struct {
 // AWSsecretAccessKey: "" (use shared credentials file or environment variable),
 // CustomEndpoint: "", Codec: encoding.JSON
 var DefaultOptions = Options{
-	TableName:            "gokv",
-	ReadCapacityUnits:    5,
-	WriteCapacityUnits:   5,
-	WaitForTableCreation: aws.Bool(true),
-	Codec:                encoding.JSON,
-	// No need to set Region, AWSaccessKeyID, AWSsecretAccessKey
-	// or CustomEndpoint because their Go zero values are fine.
+	Codec: encoding.JSON,
 }
 
 // NewClient creates a new DynamoDB client.
@@ -201,52 +159,21 @@ func NewClient(options Options) (Client, error) {
 
 	// Set default values
 	if options.TableName == "" {
-		options.TableName = DefaultOptions.TableName
-	}
-	if options.ReadCapacityUnits == 0 {
-		options.ReadCapacityUnits = DefaultOptions.ReadCapacityUnits
-	}
-	if options.WriteCapacityUnits == 0 {
-		options.WriteCapacityUnits = DefaultOptions.WriteCapacityUnits
-	}
-	if options.WaitForTableCreation == nil {
-		options.WaitForTableCreation = DefaultOptions.WaitForTableCreation
+		return result, errors.New("no options.TableName specified")
 	}
 	if options.Codec == nil {
 		options.Codec = DefaultOptions.Codec
 	}
-	// Set credentials only if set in the options.
-	// If not set, the SDK uses the shared credentials file or environment variables, which is the preferred way.
-	// Return an error if only one of the values is set.
-	var creds *credentials.Credentials
-	if (options.AWSaccessKeyID != "" && options.AWSsecretAccessKey == "") || (options.AWSaccessKeyID == "" && options.AWSsecretAccessKey != "") {
-		return result, errors.New("When passing credentials via options, you need to set BOTH AWSaccessKeyID AND AWSsecretAccessKey")
-	} else if options.AWSaccessKeyID != "" {
-		// Due to the previous check we can be sure that in this case AWSsecretAccessKey is not empty as well.
-		creds = credentials.NewStaticCredentials(options.AWSaccessKeyID, options.AWSsecretAccessKey, "")
+
+	if options.AWSConfig == nil {
+		options.AWSConfig = &aws.Config{}
 	}
 
-	config := aws.NewConfig()
-	if options.Region != "" {
-		config = config.WithRegion(options.Region)
+	if options.Session == nil {
+		options.Session = session.Must(session.NewSession())
 	}
-	if creds != nil {
-		config = config.WithCredentials(creds)
-	}
-	if options.CustomEndpoint != "" {
-		config = config.WithEndpoint(options.CustomEndpoint)
-	}
-	// Use shared config file...
-	sessionOpts := session.Options{
-		SharedConfigState: session.SharedConfigEnable,
-	}
-	// ...but allow overwrite of region and credentials if they are set in the options.
-	sessionOpts.Config.MergeIn(config)
-	session, err := session.NewSessionWithOptions(sessionOpts)
-	if err != nil {
-		return result, err
-	}
-	svc := awsdynamodb.New(session)
+
+	svc := awsdynamodb.New(options.Session, options.AWSConfig)
 
 	// Create table if it doesn't exist.
 	// Also serves as connection test.
@@ -258,69 +185,12 @@ func NewClient(options Options) (Client, error) {
 	}
 	_, err = svc.DescribeTableWithContext(timeoutCtx, &describeTableInput)
 	if err != nil {
-		awsErr, ok := err.(awserr.Error)
-		if !ok {
-			return result, err
-		} else if awsErr.Code() == awsdynamodb.ErrCodeResourceNotFoundException {
-			err = createTable(options.TableName, options.ReadCapacityUnits, options.WriteCapacityUnits, *options.WaitForTableCreation, describeTableInput, svc)
-			if err != nil {
-				return result, err
-			}
-		} else {
-			return result, err
-		}
+		return result, err
 	}
 
-	result.c = svc
+	result.svc = svc
 	result.tableName = options.TableName
 	result.codec = options.Codec
 
 	return result, nil
-}
-
-func createTable(tableName string, readCapacityUnits, writeCapacityUnits int64, waitForTableCreation bool, describeTableInput awsdynamodb.DescribeTableInput, svc *awsdynamodb.DynamoDB) error {
-	keyAttrType := "S" // For "string"
-	keyType := "HASH"  // As opposed to "RANGE"
-	createTableInput := awsdynamodb.CreateTableInput{
-		TableName: &tableName,
-		AttributeDefinitions: []*awsdynamodb.AttributeDefinition{{
-			AttributeName: &keyAttrName,
-			AttributeType: &keyAttrType,
-		}},
-		KeySchema: []*awsdynamodb.KeySchemaElement{{
-			AttributeName: &keyAttrName,
-			KeyType:       &keyType,
-		}},
-		ProvisionedThroughput: &awsdynamodb.ProvisionedThroughput{
-			ReadCapacityUnits:  &readCapacityUnits,
-			WriteCapacityUnits: &writeCapacityUnits,
-		},
-	}
-	_, err := svc.CreateTable(&createTableInput)
-	if err != nil {
-		return err
-	}
-	// If configured (true by default), block until the table is created.
-	// Typical table creation duration is 10 seconds.
-	if waitForTableCreation {
-		for try := 1; try < 16; try++ {
-			describeTableOutput, err := svc.DescribeTable(&describeTableInput)
-			if err != nil || *describeTableOutput.Table.TableStatus == "CREATING" {
-				time.Sleep(1 * time.Second)
-			} else {
-				break
-			}
-		}
-		// Last try (16th) after 15 seconds of waiting.
-		// Now handle error as such.
-		describeTableOutput, err := svc.DescribeTable(&describeTableInput)
-		if err != nil {
-			return errors.New("The DynamoDB table couldn't be created")
-		}
-		if *describeTableOutput.Table.TableStatus == "CREATING" {
-			return errors.New("The DynamoDB table took too long to be created")
-		}
-	}
-
-	return nil
 }
